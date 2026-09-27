@@ -36,6 +36,13 @@
   不跳过。主持人看到各组申请、队列与剩余车辆；参与组只看到本组申请状态与
   排位；观察席不接收申请。申请与分配结果持久化，经快照与事件恢复；
   重置演练清空申请并恢复全部余量，车辆池保留
+- 现场情报核验板：主持人创建待核验命题并指定至少两个参与组；白名单内
+  参与组凭加入码提交「支持/反对 + 简短依据」，同组修改覆盖原报告、也可撤回。
+  服务端只按不同参与组的最新报告即时重算状态（UNIQUE(claim, group)，
+  同组多次提交绝不计为多份证据）：两边均有报告为有争议；同一立场至少两组
+  且对立为零为已证实/已否定；其余为待核验。主持人实时看到逐组报告；
+  参与组只见本组报告与汇总状态；观察席完全不可见。报告持久化，
+  经快照与 WebSocket 恢复；重置清空报告但保留命题
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -63,6 +70,7 @@ from pydantic import BaseModel, Field
 
 from . import db as dbmod
 from . import export as reviewmod
+from . import intel as intelmod
 from . import polls as pollmod
 from . import vehicles as vehiclemod
 
@@ -236,13 +244,61 @@ def poll_player_view(poll: sqlite3.Row, group_id: int) -> dict:
     return data
 
 
+# ---------------------------------------------------------------- 现场情报核验板
+
+def intel_report_public(report: sqlite3.Row) -> dict:
+    """一份组报告的序列化。含依据正文，只随主持人/本组视野下发，绝不给他组与观察者。"""
+    return {
+        "group_id": report["group_id"],
+        "stance": report["stance"],          # support | oppose
+        "rationale": report["rationale"],
+        "revision": report["revision"],
+        "updated_at": report["updated_at"],
+    }
+
+
+def intel_host_view(claim: sqlite3.Row) -> dict:
+    """主持人视野：命题、白名单、逐组最新报告与汇总状态，全量下发。
+
+    逐组报告（哪一组持什么立场、依据正文）只随主持人快照/事件下发；
+    参与组视野走 intel_player_view（本组报告 + 汇总状态），观察者完全拿不到。
+    """
+    group_ids = intelmod.claim_group_ids(db, claim["id"])
+    reports = [intel_report_public(r) for r in intelmod.reports_of_claim(db, claim["id"])]
+    return {
+        "id": claim["id"],
+        "statement": claim["statement"],
+        "round": claim["round"],
+        "group_ids": group_ids,
+        "reports": reports,                  # 逐组最新报告（每组至多一份）
+        "summary": intelmod.summary(db, claim["id"]),
+        "created_at": claim["created_at"],
+    }
+
+
+def intel_player_view(claim: sqlite3.Row, group_id: int | None) -> dict:
+    """参与组视野：命题 + 本组报告 + 汇总状态（支持/反对组数与核验状态）。
+
+    汇总状态只含计数与状态，不含任何逐组立场明细与他组依据正文。
+    group_id 为 None 时用于创建广播的通用脱敏载荷（尚无本组报告）。
+    """
+    mine = (intelmod.report_of_group(db, claim["id"], group_id)
+            if group_id is not None else None)
+    return {
+        "id": claim["id"],
+        "statement": claim["statement"],
+        "round": claim["round"],
+        "group_ids": intelmod.claim_group_ids(db, claim["id"]),
+        "my_report": intel_report_public(mine) if mine is not None else None,
+        "summary": intelmod.summary(db, claim["id"]),
+    }
+
+
 def get_room_or_404(code: str) -> sqlite3.Row:
     room = db.execute("SELECT * FROM rooms WHERE code = ?", (code.upper(),)).fetchone()
     if room is None:
         raise HTTPException(status_code=404, detail="room not found")
     return room
-
-
 def get_group_or_404(room_id: int, group_id: int) -> sqlite3.Row:
     group = db.execute(
         "SELECT * FROM groups WHERE id = ? AND room_id = ?", (group_id, room_id)
@@ -487,6 +543,11 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
         snapshot["polls"] = [poll_host_view(p) for p in polls]
         # 应急车辆申请：主持人看到车辆池总量/余量与各组申请、队列（未建池为 None）
         snapshot["vehicles"] = vehiclemod.host_view(db, room["id"])
+        # 现场情报核验板：主持人看到全部命题的逐组报告与汇总状态
+        claims = db.execute(
+            "SELECT * FROM intel_claims WHERE room_id = ? ORDER BY id", (room["id"],)
+        ).fetchall()
+        snapshot["claims"] = [intel_host_view(c) for c in claims]
     elif scope is not None:
         # 参与者：只拿当前轮次、白名单包含本组的投票；
         # 已结算投票也由此下发（结算后才可见结果），旧轮次投票一律不可见
@@ -501,6 +562,16 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
         snapshot["polls"] = [poll_player_view(p, scope) for p in polls]
         # 应急车辆申请：参与组只看到本组申请状态与排位（看不到池余量与他组申请）
         snapshot["vehicles"] = {"my_request": vehiclemod.my_view(db, room["id"], scope)}
+        # 现场情报核验板：参与组只看到白名单含本组的命题，
+        # 且只见本组报告与汇总状态（看不到他组立场明细与依据正文）
+        claims = db.execute(
+            """SELECT c.* FROM intel_claims c
+               JOIN intel_claim_groups cg ON cg.claim_id = c.id
+               WHERE c.room_id = ? AND cg.group_id = ?
+               ORDER BY c.id""",
+            (room["id"], scope),
+        ).fetchall()
+        snapshot["claims"] = [intel_player_view(c, scope) for c in claims]
     return snapshot
 
 
@@ -592,8 +663,9 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
             return payload.get("id") in scope.group_ids
         if type_ in ("card_added", "group_added", "receipt_updated", "answer_updated",
                      "poll_created", "poll_vote_updated", "poll_settled",
-                     "vehicle_request_submitted", "vehicle_request_cancelled"):
-            return False  # 观察者完全不可见：未揭示卡、组加入码、回执、答复、投票、车辆申请
+                     "vehicle_request_submitted", "vehicle_request_cancelled") \
+                or type_.startswith("intel_"):
+            return False  # 观察者完全不可见：未揭示卡、组加入码、回执、答复、投票、车辆申请、情报核验
         return True  # clock / reset 等房间级事件
     if type_ in ("card_added", "card_revealed", "card_removed", "answer_lock_updated"):
         gid = payload.get("group_id")
@@ -609,6 +681,9 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
     if type_ == "vehicle_request_cancelled":
         # 受影响组（被取消组 + 补位/排位变化组）收各自脱敏载荷，其余组不感知
         return scope in (payload.get("affected_group_ids") or [])
+    if type_.startswith("intel_"):
+        # 情报核验：仅命题白名单内的参与组可见（收各自脱敏载荷，主持人全收）
+        return scope in (payload.get("group_ids") or [])
     if type_ == "group_renamed":
         return payload.get("id") == scope  # 参与者只需感知本组改名
     if type_ in ("group_added", "group_removed"):
@@ -935,6 +1010,10 @@ async def delete_group(code: str, group_id: int):
         had_vehicle_request = db.execute(
             "SELECT 1 FROM vehicle_requests WHERE group_id = ?", (group_id,)
         ).fetchone() is not None
+        # 该组在哪些情报核验命题的白名单内（其报告随组级联删除后，这些命题需即时重算）
+        affected_claim_ids = [r["claim_id"] for r in db.execute(
+            "SELECT claim_id FROM intel_claim_groups WHERE group_id = ?", (group_id,)
+        )]
         db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
         db.commit()
         await publish(room["code"], room["id"], "group_removed", {"id": group_id})
@@ -956,6 +1035,10 @@ async def delete_group(code: str, group_id: int):
                 )
         # 加入码即刻失效，踢下仍在连接的该组参与者
         await hub.close_scope(room["code"], group_id, {"kind": "error", "message": "所在参与组已被主持人删除"})
+        # 情报核验：该组报告已随组级联删除、白名单收缩，相关命题状态即时重算，
+        # 同步给主持人与其余白名单组（被删组连接已断开，不在分发之列）
+        for claim_id in affected_claim_ids:
+            await publish_intel_claim(room, claim_id, "intel_claim_updated")
         return {"ok": True}
 
 
@@ -1562,6 +1645,117 @@ async def cancel_vehicle_request(join_code: str):
         return {"ok": True, "cancelled": cancelled["quantity"]}
 
 
+# ---------------------------------------------------------------- REST：现场情报核验板
+
+class IntelClaimIn(BaseModel):
+    statement: str = Field(min_length=1, max_length=200)                # 待核验命题
+    group_ids: list[int] = Field(min_length=intelmod.MIN_CLAIM_GROUPS,
+                                 max_length=MAX_GROUPS)                 # 至少两个参与组
+
+
+class IntelReportIn(BaseModel):
+    stance: str = Field(pattern="^(support|oppose)$")                   # 支持 | 反对
+    rationale: str = Field(min_length=1, max_length=intelmod.MAX_RATIONALE_LEN)  # 简短依据
+
+
+async def publish_intel_claim(room: sqlite3.Row, claim_id: int, type_: str) -> None:
+    """命题报告/白名单变化后，把即时重算的最新状态分发给各视野。须在 state_lock 下调用。
+
+    主持人收全量（逐组报告与依据正文）；白名单内每个参与组收各自的脱敏载荷
+    （本组报告 + 汇总状态，不含他组立场明细）；非白名单组与观察者收不到。
+    """
+    claim = db.execute("SELECT * FROM intel_claims WHERE id = ?", (claim_id,)).fetchone()
+    group_ids = intelmod.claim_group_ids(db, claim_id)
+    await publish(
+        room["code"], room["id"], type_,
+        {"claim_id": claim_id, "group_ids": group_ids, "claim": intel_host_view(claim)},
+        player_payloads={
+            gid: {"claim_id": claim_id, "claim": intel_player_view(claim, gid)}
+            for gid in group_ids
+        },
+    )
+
+
+@app.post("/api/rooms/{code}/claims", status_code=201)
+async def create_intel_claim(code: str, body: IntelClaimIn):
+    """主持人创建待核验命题：指定至少两个参与组（白名单）。
+
+    任意房间状态可创建；命题归属当前轮次（仅作标记），跨重置保留。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        statement = body.statement.strip()
+        if not statement:
+            raise HTTPException(status_code=400, detail="命题不能为空")
+        group_ids = list(dict.fromkeys(body.group_ids))  # 去重保序
+        if len(group_ids) < intelmod.MIN_CLAIM_GROUPS:
+            raise HTTPException(status_code=400, detail="每条命题至少指定两个参与组")
+        for gid in group_ids:
+            get_group_or_404(room["id"], gid)  # 每个指定组都必须属于本房间
+        round_idx = current_round(room["id"])
+        claim = intelmod.create_claim(db, room["id"], statement, group_ids, round_idx)
+        host_payload = intel_host_view(claim)
+        # 参与者通用脱敏载荷：新命题必然零报告（各组 my_report 为空、状态待核验），
+        # 广播按白名单过滤
+        await publish(room["code"], room["id"], "intel_claim_created", host_payload,
+                      player_payload=intel_player_view(claim, None))
+        return host_payload
+
+
+def resolve_group_claim(join_code: str, claim_id: int) -> tuple[sqlite3.Row, sqlite3.Row]:
+    """把参与者请求（提交/撤回报告）解析为 (参与组, 命题)。
+
+    参与者凭组加入码操作，且只能操作白名单含本组的命题；
+    非白名单命题一律 404，不向参与者暴露其存在。
+    """
+    group = db.execute(
+        "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+    ).fetchone()
+    if group is None:
+        raise HTTPException(status_code=404, detail="join code not found")
+    claim = intelmod.get_claim(db, group["room_id"], claim_id)
+    if claim is None or not intelmod.group_in_whitelist(db, claim_id, group["id"]):
+        raise HTTPException(status_code=404, detail="claim not found")
+    return group, claim
+
+
+@app.put("/api/join/{join_code}/claims/{claim_id}/report")
+async def put_intel_report(join_code: str, claim_id: int, body: IntelReportIn):
+    """参与组提交/修改本组报告：支持或反对 + 简短依据；同组修改覆盖原报告。
+
+    每组每命题仅一份最新报告（UNIQUE(claim_id, group_id) 原地更新、revision +1），
+    同组多次提交绝不计为多份证据。落库后即时重算状态并广播给主持人与各白名单组。
+    """
+    async with state_lock:
+        group, claim = resolve_group_claim(join_code, claim_id)
+        try:
+            intelmod.submit_report(db, claim, group["id"], body.stance, body.rationale)
+        except intelmod.IntelError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        await publish_intel_claim(room, claim_id, "intel_claim_updated")
+        return intel_player_view(
+            db.execute("SELECT * FROM intel_claims WHERE id = ?", (claim_id,)).fetchone(),
+            group["id"],
+        )
+
+
+@app.delete("/api/join/{join_code}/claims/{claim_id}/report")
+async def withdraw_intel_report(join_code: str, claim_id: int):
+    """参与组撤回本组报告。撤回后即时重算状态并广播；本组没有报告时返回 404。"""
+    async with state_lock:
+        group, claim = resolve_group_claim(join_code, claim_id)
+        withdrawn = intelmod.withdraw_report(db, claim_id, group["id"])
+        if withdrawn is None:
+            raise HTTPException(status_code=404, detail="本组尚未提交报告")
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        await publish_intel_claim(room, claim_id, "intel_claim_updated")
+        return intel_player_view(
+            db.execute("SELECT * FROM intel_claims WHERE id = ?", (claim_id,)).fetchone(),
+            group["id"],
+        )
+
+
 # ---------------------------------------------------------------- REST：复盘包导出
 
 @app.get("/api/rooms/{code}/review.zip")
@@ -1657,6 +1851,7 @@ async def reset_room(code: str):
     现场决策投票：未结算（open）投票一律作废（选票删除、状态置 voided），
     已结算结果按轮次保留（行内 round 决定归属），作废事件仅主持人可见。
     应急车辆申请：全部申请清空（余量恢复全部），车辆池保留供新一轮使用。
+    现场情报核验板：全部报告清空（各命题回到待核验），命题与白名单保留。
     """
     async with state_lock:
         room = get_room_or_404(code)
@@ -1676,6 +1871,8 @@ async def reset_room(code: str):
         voided_ids = pollmod.void_open_polls(db, room["id"])
         # 应急车辆：清空全部申请（已分配/排队一并删除，余量恢复全部），车辆池保留
         vehiclemod.reset_requests(db, room["id"])
+        # 情报核验：清空全部报告（命题与白名单保留，各命题回到待核验）
+        intelmod.reset_reports(db, room["id"])
         # 注意：anchors 表不在清理之列——复盘锚点跨重置保留，
         # 并以行内 round 归属原轮次（当前轮次已由本 reset 事件 +1）。
         db.commit()

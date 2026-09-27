@@ -479,3 +479,106 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-size: 12px;
   font-weight: 400;
 }
+
+/* ---------------------------------------------------------- 现场情报核验板 */
+
+.intel-list { list-style: none; margin: 6px 0 4px; padding: 0; }
+.intel-item {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.intel-item.intel-confirmed { border-left-color: var(--green); }
+.intel-item.intel-refuted   { border-left-color: var(--red); }
+.intel-item.intel-disputed  { border-left-color: var(--amber); }
+.intel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.intel-statement { font-weight: 700; font-size: 14px; flex: 1; min-width: 0; }
+.intel-meta {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+}
+.intel-status-pending   { background: rgba(139, 150, 173, .15); color: var(--muted); }
+.intel-status-confirmed { background: rgba(62, 207, 142, .15); color: var(--green); }
+.intel-status-refuted   { background: rgba(239, 91, 107, .15); color: var(--red); }
+.intel-status-disputed  { background: rgba(245, 185, 66, .15); color: var(--amber); }
+.intel-badge-support { background: rgba(62, 207, 142, .15); color: var(--green); }
+.intel-badge-oppose  { background: rgba(239, 91, 107, .15); color: var(--red); }
+.intel-chip-oppose { background: rgba(239, 91, 107, .15); color: var(--red); }
+
+.intel-chips {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.intel-report {
+  margin-top: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.intel-report-meta {
+  color: var(--accent);
+  font-size: 11px;
+  margin-bottom: 4px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.intel-report-body { white-space: pre-wrap; font-size: 13px; }
+
+.intel-editor {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+.intel-stance-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.intel-stance-btn {
+  flex: 1;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.intel-stance-btn:hover { border-color: var(--accent); }
+.intel-stance-btn.intel-stance-support.chosen {
+  border-color: var(--green);
+  background: rgba(62, 207, 142, .12);
+  color: var(--green);
+  font-weight: 700;
+}
+.intel-stance-btn.intel-stance-oppose.chosen {
+  border-color: var(--red);
+  background: rgba(239, 91, 107, .12);
+  color: var(--red);
+  font-weight: 700;
+}
+.intel-rationale { margin-bottom: 6px; }
+.intel-editor-ops { display: flex; gap: 8px; align-items: center; }
+.intel-save { padding: 6px 14px; font-size: 13px; }
+.intel-withdraw {
+  background: transparent;
+  color: var(--red);
+  padding: 6px 10px;
+  font-size: 13px;
+  font-weight: 400;
+}

@@ -15,6 +15,8 @@
  * - 参与者：组加入码连接（服务端按组过滤快照与事件，不感知门槛编排）；
  *   可在已揭示卡片下提交/修改本组处置答复（每组一份，携带 revision 乐观并发，
  *   版本过期收到 409 与最新答复；锁定后只读），看不到他组答复正文；
+ *   在情报核验板对本组命题提交「支持/反对 + 简短依据」（同组覆盖、可撤回），
+ *   只见本组报告与汇总状态，看不到他组立场明细；
  * - 观察者：限时观察链接（#/observe/{token}）进入，只读——只能看到已揭示的
  *   全员卡片与分享所选组卡片，拿不到房间码、组加入码、未揭示卡片与回执明细；
  *   链接到期或被撤销时服务端主动断开，重连也会被拒绝。
@@ -33,6 +35,7 @@ const state = {
   anchors: [],     // 主持人：全部轮次的复盘锚点（参与者/观察者永远为空）
   polls: [],       // 主持人：全部轮次投票；参与者：本轮本组投票；观察者：永远为空
   vehicles: null,  // 主持人：{total, remaining, requests}；参与者：{my_request}；观察者：null
+  claims: [],      // 主持人：全部命题（逐组报告）；参与者：白名单含本组的命题（本组报告+汇总）；观察者：永远为空
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
   lastEventId: 0,
@@ -58,6 +61,8 @@ function showRoom() {
   $('#polls-panel').classList.toggle('hidden', state.role === 'observer');
   // 应急车辆申请对观察者完全不可见；主持人看全量，参与组看本组
   $('#vehicles-panel').classList.toggle('hidden', state.role === 'observer');
+  // 现场情报核验板对观察者完全不可见；主持人看逐组报告，参与组看本组与汇总状态
+  $('#intel-panel').classList.toggle('hidden', state.role === 'observer');
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -215,6 +220,24 @@ function renderGroups() {
     label.appendChild(cb);
     label.appendChild(document.createTextNode(g.name));
     pg.appendChild(label);
+  }
+
+  // 情报核验表单的组复选框（至少 2 个）；尽量保留已勾选项
+  const intelChecked = new Set(
+    [...document.querySelectorAll('#intel-groups input:checked')].map((el) => el.value)
+  );
+  const ig = $('#intel-groups');
+  ig.innerHTML = '';
+  for (const g of state.groups) {
+    const label = document.createElement('label');
+    label.className = 'share-group-chip';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = String(g.id);
+    cb.checked = intelChecked.has(String(g.id));
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(g.name));
+    ig.appendChild(label);
   }
 }
 
@@ -1000,6 +1023,245 @@ async function cancelVehicleRequest(btn) {
   }
 }
 
+/* ---------------------------------------------------------- 现场情报核验板 */
+
+const INTEL_STATUS_TEXT = { pending: '待核验', confirmed: '已证实', refuted: '已否定', disputed: '有争议' };
+const INTEL_STANCE_TEXT = { support: '支持', oppose: '反对' };
+
+function intelStatusBadge(status) {
+  const b = document.createElement('span');
+  b.className = `badge intel-status-${status}`;
+  b.textContent = INTEL_STATUS_TEXT[status] || status;
+  return b;
+}
+
+function intelStanceBadge(stance) {
+  const b = document.createElement('span');
+  b.className = `badge intel-badge-${stance}`;
+  b.textContent = INTEL_STANCE_TEXT[stance] || stance;
+  return b;
+}
+
+/* 命题列表：主持人看逐组报告，参与者看本组报告与汇总状态（观察者面板整体隐藏） */
+function renderIntel() {
+  if (state.role === 'observer') return;
+  const list = $('#intel-list');
+  // 重渲染会重建列表：先记住正在编辑的依据框，渲染后恢复焦点与未提交文本
+  const active = document.activeElement;
+  const editingId = active && active.classList && active.classList.contains('intel-rationale')
+    ? active.dataset.claimId : null;
+  list.innerHTML = '';
+  const ordered = [...state.claims].sort((a, b) => a.id - b.id);
+  $('#intel-empty').classList.toggle('hidden', ordered.length > 0);
+  for (const claim of ordered) {
+    list.appendChild(state.role === 'host' ? hostIntelItem(claim) : playerIntelItem(claim));
+  }
+  if (editingId) {
+    const ta = list.querySelector(`.intel-rationale[data-claim-id="${editingId}"]`);
+    if (ta) {
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+  }
+}
+
+function intelSummaryText(summary) {
+  const s = summary || { support: 0, oppose: 0 };
+  return `支持 ${s.support} 组 · 反对 ${s.oppose} 组`;
+}
+
+/* 主持人视角：命题、白名单各组报告状态、逐组立场与依据正文、汇总状态 */
+function hostIntelItem(claim) {
+  const li = document.createElement('li');
+  li.className = `intel-item intel-${claim.summary.status}`;
+
+  const head = document.createElement('div');
+  head.className = 'intel-head';
+  const st = document.createElement('span');
+  st.className = 'intel-statement';
+  st.textContent = `🔎 ${claim.statement}`;
+  head.appendChild(st);
+  head.appendChild(intelStatusBadge(claim.summary.status));
+  li.appendChild(head);
+
+  const meta = document.createElement('div');
+  meta.className = 'intel-meta';
+  const groups = (claim.group_ids || []).map(groupName).join('、') || '—';
+  meta.textContent = `参与组：${groups} · ${intelSummaryText(claim.summary)}`;
+  li.appendChild(meta);
+
+  // 逐组报告状态徽标：✓支持 / ✗反对 / 未报告
+  const chips = document.createElement('div');
+  chips.className = 'intel-chips';
+  const byGroup = new Map((claim.reports || []).map((r) => [r.group_id, r]));
+  for (const gid of claim.group_ids || []) {
+    const rep = byGroup.get(gid);
+    const chip = document.createElement('span');
+    chip.className = 'receipt-chip ' + (rep
+      ? (rep.stance === 'support' ? 'receipt-ok' : 'intel-chip-oppose')
+      : 'receipt-wait');
+    chip.textContent = rep
+      ? `${rep.stance === 'support' ? '✓' : '✗'} ${groupName(gid)}`
+      : `未报告 · ${groupName(gid)}`;
+    chips.appendChild(chip);
+  }
+  li.appendChild(chips);
+
+  // 逐组报告明细（立场、依据正文、版本）
+  for (const rep of claim.reports || []) {
+    const item = document.createElement('div');
+    item.className = 'intel-report';
+    const rmeta = document.createElement('div');
+    rmeta.className = 'intel-report-meta';
+    rmeta.appendChild(document.createTextNode(`${groupName(rep.group_id)} · `));
+    rmeta.appendChild(intelStanceBadge(rep.stance));
+    rmeta.appendChild(document.createTextNode(` · 版本 ${rep.revision}`));
+    item.appendChild(rmeta);
+    const body = document.createElement('div');
+    body.className = 'intel-report-body';
+    body.textContent = rep.rationale;
+    item.appendChild(body);
+    li.appendChild(item);
+  }
+  return li;
+}
+
+/* 参与者视角：命题、汇总状态（计数+状态，无他组明细）、本组报告编辑器 */
+function playerIntelItem(claim) {
+  const li = document.createElement('li');
+  li.className = `intel-item intel-${claim.summary.status}`;
+
+  const head = document.createElement('div');
+  head.className = 'intel-head';
+  const st = document.createElement('span');
+  st.className = 'intel-statement';
+  st.textContent = `🔎 ${claim.statement}`;
+  head.appendChild(st);
+  head.appendChild(intelStatusBadge(claim.summary.status));
+  li.appendChild(head);
+
+  const meta = document.createElement('div');
+  meta.className = 'intel-meta';
+  meta.textContent = `汇总状态：${intelSummaryText(claim.summary)}`;
+  li.appendChild(meta);
+
+  li.appendChild(intelEditor(claim));
+  return li;
+}
+
+/* 参与者：本组报告编辑器——支持/反对 + 简短依据；同组修改覆盖原报告，可撤回。
+   草稿存于 claim._draftStance/_draftRationale：事件重渲染不丢未提交内容；
+   本组报告被同组其他窗口改动时（revision 变化）草稿被清除、载入最新报告。 */
+function intelEditor(claim) {
+  const wrap = document.createElement('div');
+  wrap.className = 'intel-editor';
+  const my = claim.my_report || null;
+  const stance = claim._draftStance !== undefined
+    ? claim._draftStance : (my ? my.stance : null);
+  const rationale = claim._draftRationale !== undefined
+    ? claim._draftRationale : (my ? my.rationale : '');
+
+  const head = document.createElement('div');
+  head.className = 'answer-head';
+  const label = document.createElement('span');
+  label.className = 'answer-label';
+  label.textContent = '本组核验报告（同组共享一份）';
+  head.appendChild(label);
+  const rev = document.createElement('span');
+  rev.className = 'answer-rev';
+  rev.textContent = my
+    ? `已提交：${INTEL_STANCE_TEXT[my.stance]} · 版本 ${my.revision}`
+    : '尚未提交';
+  head.appendChild(rev);
+  wrap.appendChild(head);
+
+  const stanceRow = document.createElement('div');
+  stanceRow.className = 'intel-stance-row';
+  for (const s of ['support', 'oppose']) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = `intel-stance-btn intel-stance-${s}` + (stance === s ? ' chosen' : '');
+    btn.textContent = (stance === s ? '● ' : '○ ') + INTEL_STANCE_TEXT[s];
+    btn.onclick = () => {
+      claim._draftStance = s;
+      renderIntel();
+    };
+    stanceRow.appendChild(btn);
+  }
+  wrap.appendChild(stanceRow);
+
+  const ta = document.createElement('textarea');
+  ta.className = 'intel-rationale';
+  ta.dataset.claimId = claim.id;
+  ta.rows = 2;
+  ta.maxLength = 500;
+  ta.placeholder = '简短依据（必填，1～500 字）…';
+  ta.value = rationale;
+  ta.oninput = () => { claim._draftRationale = ta.value; };
+  wrap.appendChild(ta);
+
+  const ops = document.createElement('div');
+  ops.className = 'intel-editor-ops';
+  const save = document.createElement('button');
+  save.className = 'primary intel-save';
+  save.textContent = my ? '更新报告（覆盖原报告）' : '提交报告';
+  save.onclick = () => submitIntelReport(claim, stance, ta, save);
+  ops.appendChild(save);
+  if (my) {
+    const withdraw = document.createElement('button');
+    withdraw.className = 'intel-withdraw';
+    withdraw.textContent = '撤回报告';
+    withdraw.title = '撤回后本组不再计入任何一方，状态即时重算';
+    withdraw.onclick = () => withdrawIntelReport(claim, withdraw);
+    ops.appendChild(withdraw);
+  }
+  wrap.appendChild(ops);
+  return wrap;
+}
+
+/* 提交/修改本组报告：同组覆盖原报告；成功由返回值与 intel_claim_updated 事件共同收敛 */
+async function submitIntelReport(claim, stance, ta, btn) {
+  if (!stance) {
+    showError(new Error('请选择立场：支持或反对'));
+    return;
+  }
+  if (!ta.value.trim()) {
+    showError(new Error('请填写简短依据'));
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const res = await api('PUT', `/api/join/${state.code}/claims/${claim.id}/report`, {
+      stance,
+      rationale: ta.value.trim(),
+    });
+    upsertClaim(res); // 本组其他连接通过 intel_claim_updated 事件同步
+  } catch (err) {
+    showError(err);
+    btn.disabled = false;
+  }
+}
+
+/* 撤回本组报告：状态即时重算 */
+async function withdrawIntelReport(claim, btn) {
+  btn.disabled = true;
+  try {
+    const res = await api('DELETE', `/api/join/${state.code}/claims/${claim.id}/report`);
+    upsertClaim(res);
+  } catch (err) {
+    showError(err);
+    btn.disabled = false;
+  }
+}
+
+/* 用服务端下发的命题视图（按当前角色脱敏）就地更新列表 */
+function upsertClaim(view) {
+  const i = state.claims.findIndex((c) => c.id === view.id);
+  if (i >= 0) state.claims[i] = view;
+  else state.claims.push(view);
+  renderIntel();
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
@@ -1008,6 +1270,7 @@ function renderAll() {
   renderAnchors();
   renderPolls();
   renderVehicles();
+  renderIntel();
   renderCards();
 }
 
@@ -1056,6 +1319,7 @@ function applySnapshot(msg) {
     p._pastDueKey = p.status === 'open' && p.deadline_ms <= msg.room.elapsed_ms ? 1 : 0;
   });
   state.vehicles = msg.vehicles || null; // 主持人：全量（无池为 null）；参与者：{my_request}；观察者：缺省
+  state.claims = msg.claims || [];  // 主持人：全部命题（逐组报告）；参与者：白名单含本组的命题；观察者缺省为空
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
   state.round = Number.isInteger(msg.round) ? msg.round : 0;
   state.lastEventId = msg.last_event_id; // 权威水位
@@ -1222,6 +1486,30 @@ function applyEvent(msg) {
       if (state.role === 'host') state.vehicles = p.vehicles;
       else if (state.role === 'player') state.vehicles = { my_request: p.my_request };
       break;
+    case 'intel_claim_created':
+      // 主持人收全量（逐组报告），白名单参与组收脱敏载荷（my_report 为空）
+      if (!state.claims.some((c) => c.id === p.id)) state.claims.push(p);
+      break;
+    case 'intel_claim_updated': {
+      // 报告提交/修改/撤回、白名单收缩后的即时重算结果：
+      // 主持人收 {claim_id, group_ids, claim: 全量}；参与组收本组脱敏 {claim_id, claim}
+      const i = state.claims.findIndex((c) => c.id === p.claim_id);
+      const old = i >= 0 ? state.claims[i] : null;
+      const oldRev = old && old.my_report ? old.my_report.revision : 0;
+      const next = { ...(old || {}), ...p.claim };
+      const newRev = next.my_report ? next.my_report.revision : 0;
+      if (newRev !== oldRev) {
+        // 本组报告已被（同组其他窗口）改动：丢弃未提交草稿，载入最新报告
+        delete next._draftStance;
+        delete next._draftRationale;
+      } else if (old) {
+        next._draftStance = old._draftStance;
+        next._draftRationale = old._draftRationale;
+      }
+      if (i >= 0) state.claims[i] = next;
+      else state.claims.push(next);
+      break;
+    }
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -1247,6 +1535,14 @@ function applyEvent(msg) {
           state.vehicles = { my_request: null };
         }
       }
+      // 情报核验：清空全部报告（命题保留，各命题回到待核验）
+      state.claims.forEach((c) => {
+        c.summary = { support: 0, oppose: 0, status: 'pending' };
+        if (state.role === 'host') c.reports = [];
+        else c.my_report = null;
+        delete c._draftStance;
+        delete c._draftRationale;
+      });
       state.round += 1; // 重置开启新一轮；锚点不清空，旧锚点仍归属原轮次
       syncClock('idle', 0);
       break;
@@ -1341,6 +1637,7 @@ function enterRoom(code, role) {
   state.anchors = [];
   state.polls = [];
   state.vehicles = null;
+  state.claims = [];
   state.round = 0;
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
@@ -1361,6 +1658,7 @@ function enterObserver(token) {
   state.anchors = [];
   state.polls = [];
   state.vehicles = null;
+  state.claims = [];
   state.round = 0;
   state.groupId = null;
   location.hash = `#/observe/${token}`;
@@ -1619,6 +1917,32 @@ $('#vehicle-request-form').onsubmit = async (e) => {
     state.vehicles = { my_request: res };
     $('#vehicle-quantity').value = '';
     renderVehicles();
+  } catch (err) { showError(err); } finally {
+    btn.disabled = false;
+  }
+};
+
+/* 主持人创建待核验命题（至少勾选两个参与组）。
+   成功后由 intel_claim_created 事件（本连接也会收到广播）统一刷新，这里只清空表单。 */
+$('#intel-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const statement = $('#intel-statement').value.trim();
+  const groupIds = [...document.querySelectorAll('#intel-groups input:checked')]
+    .map((el) => parseInt(el.value, 10));
+  if (!statement) return;
+  if (groupIds.length < 2) {
+    showError(new Error('请至少勾选两个参与组'));
+    return;
+  }
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await api('POST', `/api/rooms/${state.code}/claims`, {
+      statement, group_ids: groupIds,
+    });
+    $('#intel-statement').value = '';
+    document.querySelectorAll('#intel-groups input:checked').forEach((el) => { el.checked = false; });
+    $('#intel-statement').focus();
   } catch (err) { showError(err); } finally {
     btn.disabled = false;
   }

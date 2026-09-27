@@ -161,6 +161,35 @@ CREATE TABLE IF NOT EXISTS vehicle_requests (
     UNIQUE (room_id, group_id)                       -- 每组同时仅一份申请，取消后才能重新申请
 );
 
+-- 现场情报核验板：主持人创建待核验命题并指定至少两个参与组；
+-- 每组每命题仅一份最新报告（同组修改覆盖、可撤回），重置清空报告但保留命题。
+CREATE TABLE IF NOT EXISTS intel_claims (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    statement  TEXT NOT NULL,                        -- 待核验命题
+    round      INTEGER NOT NULL,                     -- 创建时轮次（仅作归属标记；命题跨重置保留）
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS intel_claim_groups (
+    claim_id INTEGER NOT NULL REFERENCES intel_claims(id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (claim_id, group_id)                 -- 仅指定参与组（≥2）可见命题/提交报告
+);
+
+CREATE TABLE IF NOT EXISTS intel_reports (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    claim_id   INTEGER NOT NULL REFERENCES intel_claims(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    stance     TEXT NOT NULL,                        -- support | oppose
+    rationale  TEXT NOT NULL,                        -- 简短依据（1～500 字）
+    revision   INTEGER NOT NULL DEFAULT 1,           -- 同组每次修改 +1
+    updated_at REAL NOT NULL,
+    UNIQUE (claim_id, group_id)                      -- 每组每命题仅一份最新报告：
+                                                     -- 同组多次提交绝不计为多份证据
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_cards_gate ON cards(depends_on_card_id);
@@ -175,6 +204,10 @@ CREATE INDEX IF NOT EXISTS idx_polls_room ON polls(room_id, round, status);
 CREATE INDEX IF NOT EXISTS idx_poll_groups_group ON poll_groups(group_id);
 CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(poll_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_vehicle_requests_room ON vehicle_requests(room_id, status, queue_seq);
+CREATE INDEX IF NOT EXISTS idx_intel_claims_room ON intel_claims(room_id, id);
+CREATE INDEX IF NOT EXISTS idx_intel_claim_groups_group ON intel_claim_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_intel_reports_claim ON intel_reports(claim_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_intel_reports_room ON intel_reports(room_id, claim_id);
 """
 
 
@@ -196,6 +229,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     升级后仍按所属轮次保留。
     应急车辆申请表 vehicle_pools / vehicle_requests 同为全新表，随 SCHEMA
     在旧库直接补齐；旧库演练视为尚未创建车辆池、没有任何申请。
+    现场情报核验板表 intel_claims / intel_claim_groups / intel_reports
+    同为全新表，随 SCHEMA 在旧库直接补齐；旧库演练视为没有任何命题与报告。
     """
     table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cards'"

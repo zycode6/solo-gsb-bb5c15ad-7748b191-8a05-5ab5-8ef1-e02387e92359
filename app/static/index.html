@@ -136,6 +136,23 @@
         </div>
       </form>
 
+      <h3>现场情报核验</h3>
+      <p class="hint">填写<strong>待核验命题</strong>并勾选<strong>至少两个参与组</strong>。被勾选的
+        参与组凭加入码提交「支持 / 反对 + 简短依据」，同组修改覆盖原报告、也可撤回；服务端只按
+        <strong>不同参与组的最新报告</strong>即时重算状态：两边均有报告为<strong>有争议</strong>，
+        同一立场至少两组且对立为零为<strong>已证实 / 已否定</strong>，其余为<strong>待核验</strong>。
+        你实时看到逐组报告；参与组只见本组报告与汇总状态；观察席不可见。
+        「重置」清空全部报告但保留命题。</p>
+      <form id="intel-form">
+        <input id="intel-statement" type="text" placeholder="待核验命题，如：东区变电站已恢复供电"
+               required maxlength="200">
+        <div id="intel-groups" class="share-groups"></div>
+        <div class="share-form-row">
+          <span class="hint">至少勾选两个参与组</span>
+          <button type="submit" class="primary">创建待核验命题</button>
+        </div>
+      </form>
+
       <h3>添加注入卡片</h3>
       <form id="card-form">
         <div class="form-row">
@@ -198,6 +215,16 @@
           </div>
         </form>
       </div>
+    </section>
+
+    <!-- 现场情报核验板（主持人看逐组报告；参与组提交/撤回并看本组与汇总状态；观察者完全不可见） -->
+    <section id="intel-panel" class="panel hidden">
+      <h2>现场情报核验</h2>
+      <p class="hint">状态只按<strong>不同参与组的最新报告</strong>即时重算（同组多次提交只算一份）：
+        两边均有报告为<strong>有争议</strong>；同一立场至少两组且对立为零为<strong>已证实 / 已否定</strong>；
+        其余为<strong>待核验</strong>。「重置」清空全部报告但保留命题。</p>
+      <p id="intel-empty" class="hint">暂无待核验命题</p>
+      <ul id="intel-list" class="intel-list"></ul>
     </section>
   </main>
 
