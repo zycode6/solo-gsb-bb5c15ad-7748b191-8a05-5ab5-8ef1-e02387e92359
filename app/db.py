@@ -161,6 +161,37 @@ CREATE TABLE IF NOT EXISTS vehicle_requests (
     UNIQUE (room_id, group_id)                       -- 每组同时仅一份申请，取消后才能重新申请
 );
 
+-- 现场情报核验板：主持人创建待核验命题并指定至少两个参与组（核验白名单）；
+-- 每组对每条命题仅保留一份最新报告（同组提交覆盖原报告、可撤回），
+-- 状态完全由不同参与组的最新报告推导（同组多次提交不算多份证据）；
+-- 重置清空报告但命题与白名单保留。
+CREATE TABLE IF NOT EXISTS verification_claims (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    title      TEXT NOT NULL,                        -- 待核验命题
+    detail     TEXT NOT NULL DEFAULT '',             -- 命题背景/补充说明
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS verification_claim_groups (
+    claim_id INTEGER NOT NULL REFERENCES verification_claims(id) ON DELETE CASCADE,
+    group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    PRIMARY KEY (claim_id, group_id)                 -- 核验白名单（至少两组，由路由校验）
+);
+
+CREATE TABLE IF NOT EXISTS verification_reports (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id    INTEGER NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    claim_id   INTEGER NOT NULL REFERENCES verification_claims(id) ON DELETE CASCADE,
+    group_id   INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+    stance     TEXT NOT NULL,                        -- support（支持）| oppose（反对）
+    basis      TEXT NOT NULL DEFAULT '',             -- 简短依据
+    revision   INTEGER NOT NULL DEFAULT 1,           -- 覆盖版本号：每次同组修改 +1
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE (claim_id, group_id)                      -- 每组仅一份：再次提交原地覆盖
+);
+
 CREATE INDEX IF NOT EXISTS idx_cards_due ON cards(room_id, revealed, trigger_seconds, seq);
 CREATE INDEX IF NOT EXISTS idx_cards_group ON cards(room_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_cards_gate ON cards(depends_on_card_id);
@@ -175,6 +206,10 @@ CREATE INDEX IF NOT EXISTS idx_polls_room ON polls(room_id, round, status);
 CREATE INDEX IF NOT EXISTS idx_poll_groups_group ON poll_groups(group_id);
 CREATE INDEX IF NOT EXISTS idx_poll_votes_poll ON poll_votes(poll_id, group_id);
 CREATE INDEX IF NOT EXISTS idx_vehicle_requests_room ON vehicle_requests(room_id, status, queue_seq);
+CREATE INDEX IF NOT EXISTS idx_verification_claims_room ON verification_claims(room_id, id);
+CREATE INDEX IF NOT EXISTS idx_verification_claim_groups_group ON verification_claim_groups(group_id);
+CREATE INDEX IF NOT EXISTS idx_verification_reports_claim ON verification_reports(claim_id, group_id);
+CREATE INDEX IF NOT EXISTS idx_verification_reports_room ON verification_reports(room_id);
 """
 
 
@@ -196,6 +231,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     升级后仍按所属轮次保留。
     应急车辆申请表 vehicle_pools / vehicle_requests 同为全新表，随 SCHEMA
     在旧库直接补齐；旧库演练视为尚未创建车辆池、没有任何申请。
+    现场情报核验板三表 verification_claims / verification_claim_groups /
+    verification_reports 同为全新表，由 CREATE TABLE IF NOT EXISTS 直接补齐；
+    旧库演练视为没有任何待核验命题与报告。
     """
     table = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'cards'"

@@ -479,3 +479,71 @@ button:disabled { opacity: .35; cursor: not-allowed; }
   font-size: 12px;
   font-weight: 400;
 }
+
+/* ---------------------------------------------------------- 现场情报核验板 */
+
+.verification-list { list-style: none; margin: 6px 0 4px; padding: 0; }
+.verify-item {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.verify-item.verify-confirmed { border-left-color: var(--green); }
+.verify-item.verify-refuted   { border-left-color: var(--red); }
+.verify-item.verify-disputed  { border-left-color: var(--amber); }
+.verify-item.verify-pending   { border-left-color: var(--muted); }
+
+.verify-status-pending   { background: rgba(139, 150, 173, .15); color: var(--muted); }
+.verify-status-confirmed { background: rgba(62, 207, 142, .15); color: var(--green); }
+.verify-status-refuted   { background: rgba(239, 91, 107, .15); color: var(--red); }
+.verify-status-disputed  { background: rgba(245, 185, 66, .15); color: var(--amber); }
+
+.verify-reports {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.verify-report {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+.verify-report-missing { opacity: .6; }
+.verify-report-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.verify-report-group { font-size: 12px; font-weight: 700; }
+.verify-report-basis {
+  margin-top: 4px;
+  font-size: 13px;
+  color: var(--text);
+  white-space: pre-wrap;
+}
+
+.verify-stance-row { display: flex; gap: 8px; margin-bottom: 8px; }
+.verify-stance-btn {
+  flex: 1;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.verify-stance-btn.verify-support.chosen {
+  border-color: var(--green);
+  background: rgba(62, 207, 142, .15);
+  color: var(--green);
+}
+.verify-stance-btn.verify-oppose.chosen {
+  border-color: var(--red);
+  background: rgba(239, 91, 107, .15);
+  color: var(--red);
+}
+.verify-ops-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.verify-ops-row .answer-save { padding: 6px 14px; font-size: 13px; }
+.verify-withdraw { padding: 6px 14px; font-size: 13px; }

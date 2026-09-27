@@ -11,7 +11,7 @@ RUN pip install -r requirements.txt
 
 COPY app ./app
 
-# SQLite 数据目录（含应急车辆申请在内的全部表结构，均在应用启动时自动初始化/迁移）
+# SQLite 数据目录（含现场情报核验板在内的全部表结构，均在应用启动时自动初始化/迁移）
 RUN mkdir -p /data
 ENV DATABASE_PATH=/data/inject.db
 

@@ -33,6 +33,7 @@ const state = {
   anchors: [],     // 主持人：全部轮次的复盘锚点（参与者/观察者永远为空）
   polls: [],       // 主持人：全部轮次投票；参与者：本轮本组投票；观察者：永远为空
   vehicles: null,  // 主持人：{total, remaining, requests}；参与者：{my_request}；观察者：null
+  verifications: [], // 主持人：全部命题+逐组报告；参与者：本组命题+本组报告与汇总；观察者：永远为空
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
   lastEventId: 0,
@@ -58,6 +59,8 @@ function showRoom() {
   $('#polls-panel').classList.toggle('hidden', state.role === 'observer');
   // 应急车辆申请对观察者完全不可见；主持人看全量，参与组看本组
   $('#vehicles-panel').classList.toggle('hidden', state.role === 'observer');
+  // 现场情报核验板对观察者完全不可见；主持人与参与组共用面板（内容按角色渲染）
+  $('#verifications-panel').classList.toggle('hidden', state.role === 'observer');
   $('#cards-title').textContent =
     state.role === 'host' ? '注入卡片（全部）'
     : state.role === 'observer' ? '已揭示的情景注入（观察席 · 只读）'
@@ -215,6 +218,24 @@ function renderGroups() {
     label.appendChild(cb);
     label.appendChild(document.createTextNode(g.name));
     pg.appendChild(label);
+  }
+
+  // 核验命题表单的组复选框（至少 2 个）；尽量保留已勾选项
+  const verifyChecked = new Set(
+    [...document.querySelectorAll('#verification-groups input:checked')].map((el) => el.value)
+  );
+  const vg = $('#verification-groups');
+  vg.innerHTML = '';
+  for (const g of state.groups) {
+    const label = document.createElement('label');
+    label.className = 'share-group-chip';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = String(g.id);
+    cb.checked = verifyChecked.has(String(g.id));
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(g.name));
+    vg.appendChild(label);
   }
 }
 
@@ -1000,6 +1021,240 @@ async function cancelVehicleRequest(btn) {
   }
 }
 
+/* ---------------------------------------------------------- 现场情报核验板 */
+
+const VERIFY_STATUS_TEXT = {
+  pending: '待核验',
+  confirmed: '已证实',
+  refuted: '已否定',
+  disputed: '有争议',
+};
+const STANCE_TEXT = { support: '支持', oppose: '反对' };
+
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+function renderVerifications() {
+  if (state.role === 'observer') return;
+  const list = $('#verification-list');
+  // 重渲染会重建列表：记住正在编辑的依据框，渲染后恢复焦点与未提交文本
+  const active = document.activeElement;
+  const editingId = active && active.classList && active.classList.contains('verify-basis')
+    ? active.dataset.claimId : null;
+  const editingVal = editingId ? active.value : '';
+  list.innerHTML = '';
+  const ordered = [...state.verifications].sort((a, b) => a.id - b.id);
+  $('#verifications-empty').classList.toggle('hidden', ordered.length > 0);
+  for (const claim of ordered) {
+    list.appendChild(state.role === 'host' ? hostClaimItem(claim) : playerClaimItem(claim));
+  }
+  if (editingId) {
+    const ta = list.querySelector(`.verify-basis[data-claim-id="${editingId}"]`);
+    if (ta && !ta.disabled) {
+      ta.value = editingVal;
+      ta.focus();
+      ta.setSelectionRange(ta.value.length, ta.value.length);
+    }
+  }
+}
+
+function statusBadge(status) {
+  const span = document.createElement('span');
+  span.className = `badge verify-status-${status}`;
+  span.textContent = VERIFY_STATUS_TEXT[status] || status;
+  return span;
+}
+
+/* 主持人：命题 + 白名单组 + 汇总状态 + 逐组最新报告（立场、依据、版本、时间） */
+function hostClaimItem(claim) {
+  const li = document.createElement('li');
+  li.className = `verify-item verify-${claim.status}`;
+
+  const head = document.createElement('div');
+  head.className = 'poll-head';
+  const title = document.createElement('span');
+  title.className = 'poll-question';
+  title.textContent = `🔎 ${claim.title}`;
+  head.appendChild(title);
+  head.appendChild(statusBadge(claim.status));
+  li.appendChild(head);
+
+  if (claim.detail) {
+    const detail = document.createElement('div');
+    detail.className = 'card-content';
+    detail.textContent = claim.detail;
+    li.appendChild(detail);
+  }
+
+  const meta = document.createElement('div');
+  meta.className = 'poll-meta';
+  meta.textContent = `核验组：${(claim.group_names || []).join('、')} · 支持 ${claim.support_count}`
+    + ` · 反对 ${claim.oppose_count} · 已报告 ${claim.reports.length}/${claim.group_ids.length}`;
+  li.appendChild(meta);
+
+  // 逐组报告明细 + 未报告组
+  const detailBox = document.createElement('div');
+  detailBox.className = 'verify-reports';
+  const byGroup = new Map((claim.reports || []).map((r) => [r.group_id, r]));
+  for (const gid of claim.group_ids || []) {
+    const r = byGroup.get(gid);
+    const item = document.createElement('div');
+    item.className = 'verify-report' + (r ? '' : ' verify-report-missing');
+    const top = document.createElement('div');
+    top.className = 'verify-report-head';
+    const who = document.createElement('span');
+    who.className = 'verify-report-group';
+    if (r) {
+      who.textContent = `${r.stance === 'support' ? '✅ 支持' : '⛔ 反对'} · ${groupName(gid)}`
+        + ` · v${r.revision} · ${fmtTime(r.updated_at)}`;
+    } else {
+      who.textContent = `未报告 · ${groupName(gid)}`;
+    }
+    top.appendChild(who);
+    item.appendChild(top);
+    if (r && r.basis) {
+      const basis = document.createElement('div');
+      basis.className = 'verify-report-basis';
+      basis.textContent = r.basis;
+      item.appendChild(basis);
+    }
+    detailBox.appendChild(item);
+  }
+  li.appendChild(detailBox);
+  return li;
+}
+
+/* 参与者：命题 + 汇总状态（只给立场组数）+ 本组报告编辑区 */
+function playerClaimItem(claim) {
+  const li = document.createElement('li');
+  li.className = `verify-item verify-${claim.status}`;
+
+  const head = document.createElement('div');
+  head.className = 'poll-head';
+  const title = document.createElement('span');
+  title.className = 'poll-question';
+  title.textContent = `🔎 ${claim.title}`;
+  head.appendChild(title);
+  head.appendChild(statusBadge(claim.status));
+  li.appendChild(head);
+
+  if (claim.detail) {
+    const detail = document.createElement('div');
+    detail.className = 'card-content';
+    detail.textContent = claim.detail;
+    li.appendChild(detail);
+  }
+
+  const meta = document.createElement('div');
+  meta.className = 'poll-meta';
+  meta.textContent = `当前状态：${VERIFY_STATUS_TEXT[claim.status] || claim.status}`
+    + `（支持 ${claim.support_count} 组 · 反对 ${claim.oppose_count} 组）`;
+  li.appendChild(meta);
+
+  li.appendChild(verifyEditor(claim));
+  return li;
+}
+
+function verifyEditor(claim) {
+  const wrap = document.createElement('div');
+  wrap.className = 'answer-area';
+  const mine = claim.my_report;
+
+  const head = document.createElement('div');
+  head.className = 'answer-head';
+  const label = document.createElement('span');
+  label.className = 'answer-label';
+  label.textContent = '本组核验报告（每组一份，提交后修改将覆盖原报告）';
+  head.appendChild(label);
+  const rev = document.createElement('span');
+  rev.className = 'answer-rev';
+  rev.textContent = mine ? `已报告 · ${STANCE_TEXT[mine.stance]} · v${mine.revision}` : '尚未报告';
+  head.appendChild(rev);
+  wrap.appendChild(head);
+
+  // 立场切换：两个按钮（支持 / 反对），默认有报告时选其立场，否则默认支持
+  const stanceBox = document.createElement('div');
+  stanceBox.className = 'verify-stance-row';
+  let stance = mine ? mine.stance : 'support';
+  const buttons = {};
+  for (const s of ['support', 'oppose']) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'verify-stance-btn' + (s === 'support' ? ' verify-support' : ' verify-oppose');
+    btn.textContent = STANCE_TEXT[s];
+    btn.onclick = () => {
+      stance = s;
+      refreshStanceButtons();
+    };
+    buttons[s] = btn;
+    stanceBox.appendChild(btn);
+  }
+  function refreshStanceButtons() {
+    for (const s of ['support', 'oppose']) {
+      buttons[s].classList.toggle('chosen', stance === s);
+    }
+  }
+  refreshStanceButtons();
+  wrap.appendChild(stanceBox);
+
+  const ta = document.createElement('textarea');
+  ta.className = 'verify-basis';
+  ta.dataset.claimId = claim.id;
+  ta.rows = 2;
+  ta.maxLength = 500;
+  ta.placeholder = '简短依据（现场观察、情报来源…）';
+  ta.value = mine ? mine.basis : '';
+  wrap.appendChild(ta);
+
+  const ops = document.createElement('div');
+  ops.className = 'verify-ops-row';
+  const submit = document.createElement('button');
+  submit.type = 'button';
+  submit.className = 'primary answer-save';
+  submit.textContent = mine ? '修改本组报告（覆盖）' : '提交本组报告';
+  submit.onclick = () => submitVerifyReport(claim, stance, ta, submit);
+  ops.appendChild(submit);
+  if (mine) {
+    const withdraw = document.createElement('button');
+    withdraw.type = 'button';
+    withdraw.className = 'danger verify-withdraw';
+    withdraw.textContent = '撤回报告';
+    withdraw.onclick = () => withdrawVerifyReport(claim, withdraw);
+    ops.appendChild(withdraw);
+  }
+  wrap.appendChild(ops);
+  return wrap;
+}
+
+async function submitVerifyReport(claim, stance, ta, btn) {
+  btn.disabled = true;
+  try {
+    await api('PUT', `/api/join/${state.code}/verifications/${claim.id}/report`, {
+      stance,
+      basis: ta.value.trim(),
+    });
+    // 统一由 verification_report_updated 事件按快照口径刷新（返回值不直接合并）
+  } catch (err) {
+    showError(err);
+    btn.disabled = false;
+  }
+}
+
+async function withdrawVerifyReport(claim, btn) {
+  if (!confirm('撤回本组核验报告？撤回后命题状态将立即重算，可重新提交。')) return;
+  btn.disabled = true;
+  try {
+    await api('DELETE', `/api/join/${state.code}/verifications/${claim.id}/report`);
+  } catch (err) {
+    showError(err);
+    btn.disabled = false;
+  }
+}
+
 function renderAll() {
   renderMeta();
   renderGroups();
@@ -1008,6 +1263,7 @@ function renderAll() {
   renderAnchors();
   renderPolls();
   renderVehicles();
+  renderVerifications();
   renderCards();
 }
 
@@ -1056,6 +1312,7 @@ function applySnapshot(msg) {
     p._pastDueKey = p.status === 'open' && p.deadline_ms <= msg.room.elapsed_ms ? 1 : 0;
   });
   state.vehicles = msg.vehicles || null; // 主持人：全量（无池为 null）；参与者：{my_request}；观察者：缺省
+  state.verifications = msg.verifications || []; // 观察者快照不带该字段；主持人/参与者按角色脱敏
   state.groupId = msg.scope && msg.scope.role === 'player' ? msg.scope.group_id : null;
   state.round = Number.isInteger(msg.round) ? msg.round : 0;
   state.lastEventId = msg.last_event_id; // 权威水位
@@ -1222,6 +1479,24 @@ function applyEvent(msg) {
       if (state.role === 'host') state.vehicles = p.vehicles;
       else if (state.role === 'player') state.vehicles = { my_request: p.my_request };
       break;
+    case 'verification_claim_created':
+      // 主持人收全量命题对象；白名单参与组收按组脱敏载荷（my_report 初始为 null）
+      if (!state.verifications.some((c) => c.id === p.id)) state.verifications.push(p);
+      break;
+    case 'verification_report_updated':
+    case 'verification_report_withdrawn': {
+      // 主持人载荷带 verification 全量对象（逐组报告）；参与者只收按组脱敏对象
+      if (state.role === 'host') {
+        const v = p.verification;
+        const i = state.verifications.findIndex((c) => c.id === p.claim_id);
+        if (i >= 0) state.verifications[i] = v;
+      } else if (state.role === 'player' && p.verification) {
+        const v = p.verification;
+        const i = state.verifications.findIndex((c) => c.id === p.claim_id);
+        if (i >= 0) state.verifications[i] = { ...state.verifications[i], ...v };
+      }
+      break;
+    }
     case 'clock':
       syncClock(p.status, p.elapsed_ms);
       break;
@@ -1247,6 +1522,14 @@ function applyEvent(msg) {
           state.vehicles = { my_request: null };
         }
       }
+      // 核验板：清空各组报告，命题与白名单保留，状态全部回到待核验
+      state.verifications.forEach((c) => {
+        if (c.reports) c.reports = [];
+        c.status = 'pending';
+        c.support_count = 0;
+        c.oppose_count = 0;
+        if ('my_report' in c) c.my_report = null;
+      });
       state.round += 1; // 重置开启新一轮；锚点不清空，旧锚点仍归属原轮次
       syncClock('idle', 0);
       break;
@@ -1341,6 +1624,7 @@ function enterRoom(code, role) {
   state.anchors = [];
   state.polls = [];
   state.vehicles = null;
+  state.verifications = [];
   state.round = 0;
   state.groupId = null;
   location.hash = `#/${role}/${code}`;
@@ -1361,6 +1645,7 @@ function enterObserver(token) {
   state.anchors = [];
   state.polls = [];
   state.vehicles = null;
+  state.verifications = [];
   state.round = 0;
   state.groupId = null;
   location.hash = `#/observe/${token}`;
@@ -1619,6 +1904,34 @@ $('#vehicle-request-form').onsubmit = async (e) => {
     state.vehicles = { my_request: res };
     $('#vehicle-quantity').value = '';
     renderVehicles();
+  } catch (err) { showError(err); } finally {
+    btn.disabled = false;
+  }
+};
+
+/* 主持人创建待核验命题：至少勾选两个参与组。成功由 verification_claim_created
+   事件统一刷新（本连接也在白名单广播范围之外——主持人收全量），这里清空表单。 */
+$('#verification-form').onsubmit = async (e) => {
+  e.preventDefault();
+  const title = $('#verification-title').value.trim();
+  if (!title) return;
+  const detail = $('#verification-detail').value.trim();
+  const groupIds = [...document.querySelectorAll('#verification-groups input:checked')]
+    .map((el) => parseInt(el.value, 10));
+  if (groupIds.length < 2) {
+    showError(new Error('请至少勾选两个参与组'));
+    return;
+  }
+  const btn = e.target.querySelector('button[type=submit]');
+  btn.disabled = true;
+  try {
+    await api('POST', `/api/rooms/${state.code}/verifications`, {
+      title, detail, group_ids: groupIds,
+    });
+    $('#verification-title').value = '';
+    $('#verification-detail').value = '';
+    document.querySelectorAll('#verification-groups input:checked').forEach((el) => { el.checked = false; });
+    $('#verification-title').focus();
   } catch (err) { showError(err); } finally {
     btn.disabled = false;
   }

@@ -36,6 +36,12 @@
   不跳过。主持人看到各组申请、队列与剩余车辆；参与组只看到本组申请状态与
   排位；观察席不接收申请。申请与分配结果持久化，经快照与事件恢复；
   重置演练清空申请并恢复全部余量，车辆池保留
+- 现场情报核验板：主持人创建待核验命题并指定至少两个参与组；白名单组凭
+  加入码提交「支持/反对」立场与简短依据，每组仅保留最新一份报告（覆盖
+  原报告、可撤回）。服务端只按不同参与组的最新报告即时重算状态：
+  同一立场至少两组且对立立场为零即已证实/已否定，两边均有报告为有争议，
+  其余为待核验；同组多次提交不算多份证据。主持人实时查看逐组报告，
+  参与组只见本组报告与汇总状态，观察席不可见；重置清空报告、命题保留
 - WebSocket：先下发权威快照，再广播单调递增的增量事件
 - 分组定向：参与者凭组加入码连接，快照与后续事件都按该组过滤；
   未命中的卡片在触发前后都不通过 REST 或 WebSocket 下发，主持人始终可见全部
@@ -65,6 +71,7 @@ from . import db as dbmod
 from . import export as reviewmod
 from . import polls as pollmod
 from . import vehicles as vehiclemod
+from . import verifications as verifymod
 
 log = logging.getLogger("inject")
 logging.basicConfig(level=logging.INFO)
@@ -438,6 +445,7 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
             "groups": [{"id": g["id"], "name": g["name"]} for g in groups],  # 不含组加入码
             "cards": [card_public(c) for c in cards],            # 仅已揭示；无回执字段
         }
+        # 观察席不返回 verifications 字段：命题、汇总状态与任何报告对观察者完全不可见
     if scope is None:
         cards = db.execute(
             "SELECT * FROM cards WHERE room_id = ? ORDER BY trigger_seconds, seq",
@@ -487,6 +495,8 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
         snapshot["polls"] = [poll_host_view(p) for p in polls]
         # 应急车辆申请：主持人看到车辆池总量/余量与各组申请、队列（未建池为 None）
         snapshot["vehicles"] = vehiclemod.host_view(db, room["id"])
+        # 现场情报核验板：主持人看到全部命题、白名单与逐组最新报告（含依据、版本）
+        snapshot["verifications"] = verifymod.host_view(db, room["id"])
     elif scope is not None:
         # 参与者：只拿当前轮次、白名单包含本组的投票；
         # 已结算投票也由此下发（结算后才可见结果），旧轮次投票一律不可见
@@ -501,6 +511,8 @@ def build_snapshot(room: sqlite3.Row, scope: int | None | ObserverScope) -> dict
         snapshot["polls"] = [poll_player_view(p, scope) for p in polls]
         # 应急车辆申请：参与组只看到本组申请状态与排位（看不到池余量与他组申请）
         snapshot["vehicles"] = {"my_request": vehiclemod.my_view(db, room["id"], scope)}
+        # 核验板：只含白名单包含本组的命题；只见本组报告与汇总状态/立场组数
+        snapshot["verifications"] = verifymod.player_views(db, room["id"], scope)
     return snapshot
 
 
@@ -584,6 +596,16 @@ def event_visible(scope: int | None | ObserverScope, type_: str, payload: dict) 
         # 投票结算对参与者的推送走 Hub.send_poll_event（按组脱敏载荷），
         # 通用广播只给主持人，避免把逐组选票全量载荷发给参与者。
         return False
+    if type_.startswith("verification_"):
+        # 核验板对观察者完全不可见；参与者仅在命题白名单包含本组时可见，
+        # 且收到的是按组脱敏载荷（本组报告 + 汇总状态，无他组报告内容）。
+        # claim_created 的白名单在载荷顶层；报告事件的白名单嵌套在 verification 内。
+        whitelist = payload.get("group_ids")
+        if whitelist is None and isinstance(payload.get("verification"), dict):
+            whitelist = payload["verification"].get("group_ids")
+        if isinstance(scope, ObserverScope):
+            return False
+        return scope in (whitelist or [])
     if isinstance(scope, ObserverScope):
         if type_ in ("card_revealed", "card_removed", "answer_lock_updated"):
             gid = payload.get("group_id")
@@ -935,11 +957,39 @@ async def delete_group(code: str, group_id: int):
         had_vehicle_request = db.execute(
             "SELECT 1 FROM vehicle_requests WHERE group_id = ?", (group_id,)
         ).fetchone() is not None
+        # 该组若在核验命题白名单内，先记下受影响命题（白名单关联行随组级联删除，
+        # 删除后无法再查出）；删除后据此重算并广播。
+        affected_claim_ids = [r["claim_id"] for r in db.execute(
+            "SELECT claim_id FROM verification_claim_groups WHERE group_id = ?"
+            " ORDER BY claim_id",
+            (group_id,),
+        )]
         db.execute("DELETE FROM groups WHERE id = ?", (group_id,))
         db.commit()
         await publish(room["code"], room["id"], "group_removed", {"id": group_id})
         # 该组回执已级联删除、全员卡期望组收缩，相关门槛状态随之变化
         await publish_room_gate_refresh(room)
+        # 现场情报核验板：该组的白名单关联与报告已随组级联删除。
+        # 对每条受影响命题向主持人下发最新全量视图；仍留在白名单内的参与组
+        # 收到按组脱敏载荷（状态可能因证据组数变化而翻转）。被删组的连接
+        # 随后即被关闭，无需再给它投递。
+        for claim_id in affected_claim_ids:
+            claim = db.execute(
+                "SELECT * FROM verification_claims WHERE id = ?", (claim_id,)
+            ).fetchone()
+            if claim is None:
+                continue
+            gids = verifymod.claim_group_ids(db, claim["id"])
+            await publish(
+                room["code"], room["id"], "verification_report_withdrawn",
+                {"claim_id": claim["id"], "group_id": group_id,
+                 "verification": verifymod.claim_host_view(db, claim)},
+                player_payloads={
+                    gid: {"claim_id": claim["id"],
+                          "verification": verifymod.claim_player_view(db, claim, gid)}
+                    for gid in gids
+                },
+            )
         # 应急车辆：该组申请已随组级联删除；若释放了已分配车辆（或排队排位
         # 前移），从队首补位并同步仍持有申请的各组（队首数量不足不跳过）
         if vehiclemod.get_pool(db, room["id"]) is not None:
@@ -1562,6 +1612,118 @@ async def cancel_vehicle_request(join_code: str):
         return {"ok": True, "cancelled": cancelled["quantity"]}
 
 
+# ---------------------------------------------------------------- REST：现场情报核验板
+
+class VerificationClaimIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    detail: str = Field(default="", max_length=2000)
+    group_ids: list[int] = Field(min_length=2, max_length=MAX_GROUPS)  # 至少指定两个参与组
+
+
+class VerificationReportIn(BaseModel):
+    stance: str = Field(pattern="^(support|oppose)$")  # 支持 | 反对
+    basis: str = Field(default="", max_length=verifymod.MAX_BASIS_LEN)  # 简短依据
+
+
+@app.post("/api/rooms/{code}/verifications", status_code=201)
+async def create_verification_claim(code: str, body: VerificationClaimIn):
+    """主持人创建待核验命题并指定至少两个参与组（核验白名单）。
+
+    任意房间状态可创建；命题持久化，重置演练只清空各组报告、命题与白名单
+    保留。返回主持人全量命题视图（含逐组报告，初始为空、状态待核验）。
+    """
+    async with state_lock:
+        room = get_room_or_404(code)
+        title = body.title.strip()
+        group_ids = list(dict.fromkeys(body.group_ids))  # 去重保序
+        if len(group_ids) < verifymod.MIN_CLAIM_GROUPS:
+            raise HTTPException(status_code=400,
+                                detail="每条命题至少指定两个参与组")
+        for gid in group_ids:
+            get_group_or_404(room["id"], gid)  # 每个指定组都必须属于本房间
+        claim = verifymod.create_claim(db, room["id"], title, body.detail, group_ids)
+        host_payload = verifymod.claim_host_view(db, claim)
+        # 参与者脱敏载荷：命题本身 + 本组尚无报告；不含任何他组信息
+        player_payloads = {
+            gid: verifymod.claim_player_view(db, claim, gid) for gid in group_ids
+        }
+        await publish(room["code"], room["id"], "verification_claim_created",
+                      host_payload, player_payloads=player_payloads)
+        return host_payload
+
+
+@app.put("/api/join/{join_code}/verifications/{claim_id}/report")
+async def submit_verification_report(join_code: str, claim_id: int,
+                                     body: VerificationReportIn):
+    """参与组提交/覆盖本组核验报告：每组仅一份，同组再次提交覆盖原报告。
+
+    仅命题白名单内的组可提交（非白名单/他房命题一律 404，不暴露命题存在）。
+    服务端在 state_lock 内更新后即时重算状态并广播：主持人收含逐组报告的
+    全量命题视图；各白名单组只收按组脱敏的命题视图（本组报告 + 汇总状态）。
+    同组多次提交原地更新同一行，绝不计作多份证据。
+    """
+    async with state_lock:
+        group = db.execute(
+            "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(status_code=404, detail="join code not found")
+        claim = verifymod.get_claim(db, group["room_id"], claim_id)
+        if claim is None or group["id"] not in verifymod.claim_group_ids(db, claim_id):
+            raise HTTPException(status_code=404, detail="verification claim not found")
+        row, _first = verifymod.submit_report(
+            db, group["room_id"], claim, group["id"],
+            body.stance, body.basis.strip())
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        group_ids = verifymod.claim_group_ids(db, claim_id)
+        await publish(
+            room["code"], room["id"], "verification_report_updated",
+            {"claim_id": claim_id, "group_id": group["id"],
+             "stance": row["stance"], "revision": row["revision"],
+             "verification": verifymod.claim_host_view(db, claim)},
+            player_payloads={
+                gid: {"claim_id": claim_id,
+                      "verification": verifymod.claim_player_view(db, claim, gid)}
+                for gid in group_ids
+            },
+        )
+        return verifymod.claim_player_view(db, claim, group["id"])
+
+
+@app.delete("/api/join/{join_code}/verifications/{claim_id}/report")
+async def withdraw_verification_report(join_code: str, claim_id: int):
+    """参与组撤回本组核验报告（之后可重新提交）；无报告返回 404。
+
+    删除后服务端即时重算状态并按视野广播；撤回同样只影响本组这一份证据。
+    """
+    async with state_lock:
+        group = db.execute(
+            "SELECT * FROM groups WHERE join_code = ?", (join_code.upper(),)
+        ).fetchone()
+        if group is None:
+            raise HTTPException(status_code=404, detail="join code not found")
+        claim = verifymod.get_claim(db, group["room_id"], claim_id)
+        if claim is None or group["id"] not in verifymod.claim_group_ids(db, claim_id):
+            raise HTTPException(status_code=404, detail="verification claim not found")
+        try:
+            verifymod.withdraw_report(db, claim, group["id"])
+        except verifymod.VerificationError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+        room = db.execute("SELECT * FROM rooms WHERE id = ?", (group["room_id"],)).fetchone()
+        group_ids = verifymod.claim_group_ids(db, claim_id)
+        await publish(
+            room["code"], room["id"], "verification_report_withdrawn",
+            {"claim_id": claim_id, "group_id": group["id"],
+             "verification": verifymod.claim_host_view(db, claim)},
+            player_payloads={
+                gid: {"claim_id": claim_id,
+                      "verification": verifymod.claim_player_view(db, claim, gid)}
+                for gid in group_ids
+            },
+        )
+        return {"ok": True, "claim_id": claim_id}
+
+
 # ---------------------------------------------------------------- REST：复盘包导出
 
 @app.get("/api/rooms/{code}/review.zip")
@@ -1657,6 +1819,8 @@ async def reset_room(code: str):
     现场决策投票：未结算（open）投票一律作废（选票删除、状态置 voided），
     已结算结果按轮次保留（行内 round 决定归属），作废事件仅主持人可见。
     应急车辆申请：全部申请清空（余量恢复全部），车辆池保留供新一轮使用。
+    现场情报核验板：清空全部命题的各组报告（状态随之回到待核验），
+    命题与参与组白名单保留供新一轮使用（参与者随 reset 事件清空本组报告）。
     """
     async with state_lock:
         room = get_room_or_404(code)
@@ -1676,6 +1840,8 @@ async def reset_room(code: str):
         voided_ids = pollmod.void_open_polls(db, room["id"])
         # 应急车辆：清空全部申请（已分配/排队一并删除，余量恢复全部），车辆池保留
         vehiclemod.reset_requests(db, room["id"])
+        # 核验板：清空全部报告，命题与白名单保留（状态由持久化行推导，自然回到待核验）
+        verifymod.reset_reports(db, room["id"])
         # 注意：anchors 表不在清理之列——复盘锚点跨重置保留，
         # 并以行内 round 归属原轮次（当前轮次已由本 reset 事件 +1）。
         db.commit()
